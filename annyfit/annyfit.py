@@ -38,7 +38,7 @@ class Annyfit:
         self.logger_enabled = self.cfg.get('logger_enabled', True)
         self.img_prefixes = [f.split('.')[0] for f in os.listdir(cfg.data.dataset_folder)]
         anny_model = anny.create_fullbody_model(remove_unattached_vertices=False,
-                                                local_changes=True, default_pose_parameterization='root_relative_world')
+                                                local_changes=True)
         self.bone_labels = anny_model.bone_labels
         self.shape_labels = anny_model.phenotype_labels
 
@@ -104,7 +104,7 @@ class Annyfit:
         bbox = torch.from_numpy(img_data['bboxes'][pids])
         dense_kp = dense_kps_to_fullimage(dense_cropped, bbox)
 
-        kp2d = torch.from_numpy(img_data['keypoints'][pids])  # body kps in coco format (bs, 17, 3)
+        kp2d = torch.from_numpy(img_data['all_keypoints'][pids])  # all 163 SMPL-X joints (bs, 163, 3)
 
         masks = torch.from_numpy(img_data["masks"][pids] > 0)
         depth = torch.from_numpy(img_data['median_depth'][pids])
@@ -122,6 +122,11 @@ class Annyfit:
         if 'depth_map' in img_data:
             scene_depth = torch.from_numpy(img_data['depth_map'])
             target_data['depth_map'] = scene_depth
+
+        if 'sapiens_normal' in img_data:
+            # (H, W, 3) float16 → (1, 3, H, W) float32
+            sn = torch.from_numpy(img_data['sapiens_normal'].astype(np.float32))
+            target_data['sapiens_normal'] = sn.permute(2, 0, 1).unsqueeze(0)
 
         return initial_params, target_data, K, img_path
 
