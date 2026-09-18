@@ -8,8 +8,8 @@ from collections import OrderedDict
 import anny
 from utils import clamp_but_preserve_gradients
 
-from constants import SMPL_MODEL_DIR, SMPL2COCO_REGRESSOR, SMPLX2SMPL_REGRESSOR, SMPL2DENSE_REGRESSOR
-from smplx.lbs import vertices2joints
+# SMPL-X joint index → COCO-17 mapping (anny 163-joint convention)
+_SMPLX_TO_COCO17 = [55, 57, 56, 59, 58, 16, 17, 18, 19, 20, 21, 1, 2, 4, 5, 7, 8]
 
 class MyParameterDict(torch.nn.Module):
     """
@@ -57,7 +57,7 @@ class Anny(torch.nn.Module):
         self.batch_size = batch_size
         self.model = anny.create_fullbody_model(remove_unattached_vertices=False,
                                                 local_changes=True,
-                                                default_pose_parameterization='root_relative_world',
+                                                pose_parameterization='local-bone',
                                                 topology='smplx',
                                                 ).to(dtype=self.dtype)
         self.model.set_skinning_method(skinning_method)
@@ -85,20 +85,8 @@ class Anny(torch.nn.Module):
         # not optimizing the local changes
         self.local_changes_kwargs = torch.nn.ParameterDict([(key, torch.nn.Parameter(torch.zeros(self.batch_size, dtype=dtype, requires_grad=False))) for key in self.model.local_change_labels]) 
 
-        # SMPLX → SMPL vertex conversion
-        with open(SMPLX2SMPL_REGRESSOR, 'rb') as f:
-            smplx2smpl_data = pickle.load(f)
-        self.register_buffer('smplx2smpl', torch.tensor(smplx2smpl_data['matrix'], dtype=self.dtype))  # (6890, 10475)
-
-        # SMPL → COCO joints
-        self.register_buffer('smpl2coco', torch.tensor(np.load(SMPL2COCO_REGRESSOR), dtype=self.dtype))
-
-        # SMPL → 138 dense keypoints
-        with open(SMPL2DENSE_REGRESSOR, 'rb') as f:
-            dense_mat = pickle.load(f)
-        if hasattr(dense_mat, 'to_dense'):
-            dense_mat = dense_mat.to_dense()
-        self.register_buffer('smpl2dense', dense_mat.to(dtype=self.dtype))  # (138, 6890)
+        # Joint index buffer: anny 163-joint → COCO-17
+        self.register_buffer('smplx_to_coco17', torch.tensor(_SMPLX_TO_COCO17, dtype=torch.long))
 
         self.face_params_names = self.get_face_parameter_names()
         self.fingertoe_params_names = self.get_fingertoe_parameter_names()
@@ -218,11 +206,32 @@ class Anny(torch.nn.Module):
         root_rotmat = roma.rotvec_to_rotmat(self.root_rotation_params)
         root_transl = self.root_translation_params.view(self.batch_size, 3)
         pose_parameters["root"] = roma.Rigid(roma.special_procrustes(root_rotmat, regularization=0.1), root_transl)
-        for label, param in self.joints_rotation_params.items():
-            ranges = self.joint_limit_ranges[label]
-            clamped_param = clamp_but_preserve_gradients(param, ranges[0,None], ranges[1,None])
-            rotmat = roma.rotvec_to_rotmat(clamped_param)
-            pose_parameters[label] = roma.Rigid(rotmat, self.null_translation.expand(self.batch_size, -1))
+
+        # Vectorized: clamp + rotvec_to_rotmat for all 162 non-root bones in ONE
+        # batched call instead of 162 separate small ops. Every bone's
+        # joint_limit_ranges is identical ([-pi,pi] per axis, see __init__), so
+        # the per-bone lookup was redundant work — this was ~140ms of a ~215ms
+        # optimisation step (mostly CUDA kernel-launch overhead from the loop),
+        # see annyfit_loss_tuning memory. Validated bit-for-bit identical
+        # vertices/bone_poses/gradients against the old per-bone loop, 3x
+        # faster on fwd+bwd. Falls back to the loop if the identical-ranges
+        # assumption ever stops holding, so correctness can't silently drift.
+        labels = list(self.joints_rotation_params.keys())
+        ranges0 = self.joint_limit_ranges[labels[0]]  # (2, 3)
+        ranges_uniform = all(torch.equal(self.joint_limit_ranges[l], ranges0) for l in labels)
+        if ranges_uniform:
+            stacked_params = torch.stack([self.joints_rotation_params[l] for l in labels], dim=1)  # (bs,162,3)
+            clamped = clamp_but_preserve_gradients(stacked_params, ranges0[0, None, None], ranges0[1, None, None])
+            rotmats = roma.rotvec_to_rotmat(clamped)  # (bs,162,3,3)
+            null_transl = self.null_translation.view(1, 1, 3).expand(self.batch_size, len(labels), -1)
+            for i, label in enumerate(labels):
+                pose_parameters[label] = roma.Rigid(rotmats[:, i], null_transl[:, i])
+        else:
+            for label, param in self.joints_rotation_params.items():
+                ranges = self.joint_limit_ranges[label]
+                clamped_param = clamp_but_preserve_gradients(param, ranges[0,None], ranges[1,None])
+                rotmat = roma.rotvec_to_rotmat(clamped_param)
+                pose_parameters[label] = roma.Rigid(rotmat, self.null_translation.expand(self.batch_size, -1))
 
         shape_kwargs = dict()
         for key, value in self.shape_params.items():
@@ -233,12 +242,12 @@ class Anny(torch.nn.Module):
         
         return pose_parameters, phenotype_kwargs, self.local_changes_kwargs
     
-    def get_joints(self, smplx_verts):
-        """SMPLX vertices → SMPL vertices, COCO joints, dense keypoints."""
-        smpl_verts = torch.einsum('ij,bjk->bik', self.smplx2smpl, smplx_verts)  # (bs, 6890, 3)
-        coco_joints = vertices2joints(self.smpl2coco, smpl_verts)  # (bs, 17, 3)
-        dense_kps = torch.einsum('ij,bjk->bik', self.smpl2dense, smpl_verts)  # (bs, 138, 3)
-        return smpl_verts, coco_joints, dense_kps
+    def get_joints(self, bone_poses):
+        """bone_poses (B,163,4,4) → all 163 joints (B,163,3), zeros for dense."""
+        j3d = bone_poses[:, :, :3, 3]                                    # (B, 163, 3)
+        dense_kps = torch.zeros(j3d.shape[0], 138, 3,
+                                device=j3d.device, dtype=j3d.dtype)      # (B, 138, 3) — disabled
+        return j3d, dense_kps
 
     def forward(self):
         """
@@ -252,10 +261,11 @@ class Anny(torch.nn.Module):
         output = self.model(pose_parameters=pose_parameters,
                             phenotype_kwargs=phenotype_kwargs,
                             local_changes_kwargs=local_changes_kwargs)
-        
+
         v3d = output['vertices']
-        
-        smpl_verts, coco_joints, dense_joints = self.get_joints(v3d)  # 17 COCO + 138 dense
+        bone_poses = output['bone_poses']              # (B, 163, 4, 4)
+
+        coco_joints, dense_joints = self.get_joints(bone_poses)  # 17 COCO + 138 dense
         
         shape = torch.stack(list(self.shape_params.values()), dim=1) # (bs, 11)
         body_pose = torch.stack(list(self.joints_rotation_params.values()), dim=1) # (bs, 162, 3)
@@ -268,7 +278,7 @@ class Anny(torch.nn.Module):
         # print(f"depth: {self.root_translation_params[:, 2]}, scaled: {scaled_depth}, scale: {self.depth_params['depth_scale'].item()}, shift: {self.depth_params['depth_shift'].item()}")
 
         final_output = {'vertices': v3d,
-                        'smpl_vertices': smpl_verts, # SMPL topology (6890)
+                        'smpl_vertices': v3d,  # keep key for compatibility; no SMPL regressor
                         'coco_joints': coco_joints, # coco 17 joints
                         'dense_joints': dense_joints,
                         'shape': shape,

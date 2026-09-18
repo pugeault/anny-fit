@@ -4,6 +4,47 @@ import torch.nn.functional as F
 from omegaconf import DictConfig
 
 
+class SapiensNormalLoss(nn.Module):
+    """L1 + outlier-gate normal loss (pixel3dmm / SAM-3D style).
+
+    Both tensors must already be in the same convention ([-1,1] per channel).
+    `mask` is a binary (0/1) float tensor marking pixels to include.
+    """
+    def __init__(self, delta: float = 0.33):
+        super().__init__()
+        self.delta = delta
+
+    def forward(self, rendered: torch.Tensor, target: torch.Tensor,
+                mask: torch.Tensor) -> torch.Tensor:
+        # rendered / target: (1, 3, H, W);  mask: (1, 1, H, W)
+        diff = (rendered - target) * mask
+        inlier = (diff.abs().sum(dim=1, keepdim=True) / 3.0 < self.delta).float()
+        denom = mask.sum().clamp(min=1.0)
+        return (diff.abs() * inlier).sum() / (denom * 3.0)
+
+
+class UniDepthMapLoss(nn.Module):
+    """L1 + outlier-gate dense scene-depth loss (SapiensNormalLoss style, but
+    for metric depth in meters instead of unit normal vectors).
+
+    `rendered` is the mesh's rasterized camera-space Z per pixel; `target` is
+    UniDepth's per-pixel scene depth (same camera, same metric convention, so
+    no coordinate conversion is needed — unlike the normal loss). `mask`
+    additionally excludes invalid (<=0) UniDepth pixels.
+    """
+    def __init__(self, delta: float = 0.05):
+        super().__init__()
+        self.delta = delta
+
+    def forward(self, rendered: torch.Tensor, target: torch.Tensor,
+                mask: torch.Tensor) -> torch.Tensor:
+        # rendered / target: (1, 1, H, W);  mask: (1, 1, H, W)
+        diff = (rendered - target) * mask
+        inlier = (diff.abs() < self.delta).float()
+        denom = mask.sum().clamp(min=1.0)
+        return (diff.abs() * inlier).sum() / denom
+
+
 def gmof(residual, sigma):
     """
     Geman-McClure robust error function.
@@ -111,11 +152,20 @@ class BodyFittingLoss(nn.Module):
         self.pose_init_weight = loss_cfg.pose_init_weight
         self.verts_init_weight = loss_cfg.verts_init_weight
 
+        normal_cfg = loss_cfg.get('normal', None)
+        self.normal_weight = normal_cfg.weight if normal_cfg else 0.0
+        self.normal_loss = SapiensNormalLoss(delta=normal_cfg.get('delta', 0.33) if normal_cfg else 0.33)
+
+        depth_map_cfg = loss_cfg.get('depth_map', None)
+        self.depth_map_weight = depth_map_cfg.weight if depth_map_cfg else 0.0
+        self.depth_map_loss = UniDepthMapLoss(delta=depth_map_cfg.get('delta', 0.05) if depth_map_cfg else 0.05)
+
     def update_weights(self, stage_loss_weights: DictConfig):
         """Updates the loss weights for the current stage."""
         weights_to_update = (
             'pose_init_weight', 'shape_init_weight', 'verts_init_weight',
             'depth_weight', 'kp_depth_weight', 'ordering_depth_weight',
+            'normal_weight', 'depth_map_weight',
         )
         for attr_name in weights_to_update:
             default_value = getattr(self, attr_name)
@@ -126,35 +176,42 @@ class BodyFittingLoss(nn.Module):
                 verts_init, init_pose, init_shape, target_kpts_2d, target_dense_kp,
                 est_shape_attr=None, est_depth=None, est_kp_depth=None,
                 est_depth_scale=None, est_depth_shift=None,
-                target_shape_attr=None, target_depth=None, target_kp_depth=None):
+                target_shape_attr=None, target_depth=None, target_kp_depth=None,
+                rendered_normals=None, target_normals=None, normal_mask=None,
+                rendered_depth_map=None, target_depth_map=None, depth_map_mask=None):
         # --- Reprojection Losses ---
         loss_kpts = self.kpts_2d_loss(est_kpts_2d, target_kpts_2d[:, :, :2], conf=target_kpts_2d[:, :, 2])
-        loss_dense = self.dense_kp_loss(est_dense_kp, target_dense_kp[:, :, :2], conf=target_dense_kp[:, :, 2])
+        weighted_loss_kpts = self.kpts_2d_weight * loss_kpts
 
         # --- Regularization and Prior Losses ---
         verts_init_loss = ((model_verts - verts_init)**2).sum(dim=[-1, -2])
         pose_loss = ((body_pose - init_pose)**2).sum(dim=[-1, -2])
         beta_loss = ((shape - init_shape)**2).sum(dim=-1)
 
-        weighted_loss_kpts = self.kpts_2d_weight * loss_kpts
-        weighted_loss_dense = self.dense_kp_weight * loss_dense
         weighted_verts_init_loss = self.verts_init_weight * verts_init_loss
         weighted_pose_loss = self.pose_init_weight * pose_loss
         weighted_shape_loss = self.shape_init_weight * beta_loss
 
         total_loss = (
-            weighted_loss_kpts + weighted_loss_dense +
+            weighted_loss_kpts +
             weighted_verts_init_loss + weighted_pose_loss +
             weighted_shape_loss)
 
         loss_dict = {
             'loss/keypoints_2d': weighted_loss_kpts.detach().mean().item(),
-            'loss/dense_kp': weighted_loss_dense.detach().mean().item(),
             'loss/shape_init': weighted_shape_loss.detach().mean().item(),
             'loss/verts_init': weighted_verts_init_loss.detach().mean().item(),
             'loss/pose_init': weighted_pose_loss.detach().mean().item(),
             'loss/total_loss_per_person': total_loss.detach(),
         }
+
+        # Dense kp: only compute when weight > 0 (placeholder zeros → div-by-zero otherwise)
+        if self.dense_kp_weight > 0:
+            loss_dense = self.dense_kp_loss(est_dense_kp, target_dense_kp[:, :, :2],
+                                            conf=target_dense_kp[:, :, 2])
+            weighted_loss_dense = self.dense_kp_weight * loss_dense
+            total_loss = total_loss + weighted_loss_dense
+            loss_dict['loss/dense_kp'] = weighted_loss_dense.detach().mean().item()
 
         total_loss = total_loss.mean()
 
@@ -183,6 +240,20 @@ class BodyFittingLoss(nn.Module):
             weighted_ordering_loss = self.ordering_depth_weight * loss_ordering
             total_loss += weighted_ordering_loss
             loss_dict['loss/ordering_depth'] = weighted_ordering_loss.item()
+
+        # --- Surface Normal Loss ---
+        if self.normal_weight > 0 and rendered_normals is not None:
+            loss_normal = self.normal_loss(rendered_normals, target_normals, normal_mask)
+            weighted_normal_loss = self.normal_weight * loss_normal
+            total_loss = total_loss + weighted_normal_loss
+            loss_dict['loss/normal'] = weighted_normal_loss.item()
+
+        # --- UniDepth Dense Depth-Map Loss ---
+        if self.depth_map_weight > 0 and rendered_depth_map is not None:
+            loss_depth_map = self.depth_map_loss(rendered_depth_map, target_depth_map, depth_map_mask)
+            weighted_depth_map_loss = self.depth_map_weight * loss_depth_map
+            total_loss = total_loss + weighted_depth_map_loss
+            loss_dict['loss/depth_map'] = weighted_depth_map_loss.item()
 
         loss_dict['loss/total_loss'] = total_loss.item()
         return total_loss, loss_dict
