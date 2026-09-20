@@ -430,12 +430,23 @@ class AnnyfitStage(pl.LightningModule):
             depth_map_mask=depth_map_mask,
         )
         total_loss.backward()
-        # Long warm-started chains (e.g. sequential per-frame tracking) can hit an
-        # occasional bad frame where the gradient spikes and Adam's step blows the
-        # parameters to NaN, which then propagates forever (NaN warm-starts every
-        # subsequent frame). Clip to keep a single bad step from ever doing that.
-        torch.nn.utils.clip_grad_norm_(
-            [p for group in optimizer.param_groups for p in group['params']], max_norm=5.0)
+        # Two separate failure modes, both fatal for a long warm-started chain
+        # (NaN params warm-start every later frame):
+        # 1. A gradient spike blowing Adam's step up  -> clip the norm.
+        # 2. A NON-FINITE gradient. The anny shape model's backward pass returns
+        #    NaN on all six shape params at isolated exact values (e.g. weight=0.96,
+        #    height=0.42 in a sweep of P111009's pose) -- a measure-zero interpolation
+        #    singularity Adam/clipping hits in practice. clip_grad_norm_ on a NaN norm
+        #    scales EVERY gradient to NaN and poisons all parameters, so zero the bad
+        #    gradients first and nudge the affected shape params off the singular
+        #    point (a 2e-3 jitter is far wider than the singular region).
+        opt_params = [p for group in optimizer.param_groups for p in group['params']]
+        for p in opt_params:
+            if p.grad is not None and not torch.isfinite(p.grad).all():
+                if p.numel() == 1:  # scalar shape phenotype
+                    p.data.add_(torch.empty_like(p).uniform_(-2e-3, 2e-3)).clamp_(0.0, 1.0)
+                p.grad = torch.nan_to_num(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
+        torch.nn.utils.clip_grad_norm_(opt_params, max_norm=5.0)
         optimizer.step()
 
         return loss_dict
