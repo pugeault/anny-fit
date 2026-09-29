@@ -4,6 +4,38 @@ import torch.nn.functional as F
 from omegaconf import DictConfig
 
 
+class MeshPriorLoss(nn.Module):
+    """Dead-zone symmetric chamfer distance to a prior mesh from another body
+    model (e.g. SAM-3D/MHR), whose topology differs from Anny's.
+
+    Points should be sampled uniformly over each mesh's surface area (not
+    per-vertex: SMPL-X-topology Anny packs its vertices into the face). Each
+    set is centred on its bounding-box centre and the prior is rescaled to the
+    estimate's bounding-box diagonal -- both statistics are independent of
+    vertex density, unlike a centroid (which sits near Anny's chin) -- with
+    the estimate's centre/scale detached. So only pose and body proportions
+    relative to the camera are compared, not position or absolute size, which
+    depend on each model's own focal/depth assumptions (SAM-3D's P010409 mesh
+    is ~11% taller than Anny's). Each point contributes relu(d - tau)^2 where d
+    is its distance to the nearest point of the other set: deviations within
+    tau are free, larger ones grow quadratically."""
+
+    @staticmethod
+    def _bbox(p):
+        lo, hi = p.min(dim=1).values, p.max(dim=1).values      # (B, 3)
+        return (lo + hi) / 2, (hi - lo).norm(dim=-1)            # centre (B,3), diagonal (B,)
+
+    def forward(self, est_pts: torch.Tensor, prior_pts: torch.Tensor, tau: float) -> torch.Tensor:
+        ca, sa = self._bbox(est_pts.detach())
+        cb, sb = self._bbox(prior_pts)
+        a = est_pts - ca[:, None]                                            # (B, Na, 3)
+        b = (prior_pts - cb[:, None]) * (sa / sb.clamp(min=1e-6))[:, None, None]  # (B, Nb, 3)
+        d = torch.cdist(a, b)                                  # (B, Na, Nb)
+        d_ab = d.min(dim=2).values
+        d_ba = d.min(dim=1).values
+        return (F.relu(d_ab - tau) ** 2).mean(dim=1) + (F.relu(d_ba - tau) ** 2).mean(dim=1)
+
+
 class SapiensNormalLoss(nn.Module):
     """L1 + outlier-gate normal loss (pixel3dmm / SAM-3D style).
 
@@ -160,12 +192,17 @@ class BodyFittingLoss(nn.Module):
         self.depth_map_weight = depth_map_cfg.weight if depth_map_cfg else 0.0
         self.depth_map_loss = UniDepthMapLoss(delta=depth_map_cfg.get('delta', 0.05) if depth_map_cfg else 0.05)
 
+        prior_cfg = loss_cfg.get('mesh_prior', None)
+        self.mesh_prior_weight = prior_cfg.weight if prior_cfg else 0.0
+        self.mesh_prior_tau = prior_cfg.get('tau', 0.04) if prior_cfg else 0.04
+        self.mesh_prior_loss = MeshPriorLoss()
+
     def update_weights(self, stage_loss_weights: DictConfig):
         """Updates the loss weights for the current stage."""
         weights_to_update = (
             'pose_init_weight', 'shape_init_weight', 'verts_init_weight',
             'depth_weight', 'kp_depth_weight', 'ordering_depth_weight',
-            'normal_weight', 'depth_map_weight',
+            'normal_weight', 'depth_map_weight', 'mesh_prior_weight', 'mesh_prior_tau',
         )
         for attr_name in weights_to_update:
             default_value = getattr(self, attr_name)
@@ -178,7 +215,8 @@ class BodyFittingLoss(nn.Module):
                 est_depth_scale=None, est_depth_shift=None,
                 target_shape_attr=None, target_depth=None, target_kp_depth=None,
                 rendered_normals=None, target_normals=None, normal_mask=None,
-                rendered_depth_map=None, target_depth_map=None, depth_map_mask=None):
+                rendered_depth_map=None, target_depth_map=None, depth_map_mask=None,
+                est_prior_pts=None, target_prior_pts=None):
         # --- Reprojection Losses ---
         loss_kpts = self.kpts_2d_loss(est_kpts_2d, target_kpts_2d[:, :, :2], conf=target_kpts_2d[:, :, 2])
         weighted_loss_kpts = self.kpts_2d_weight * loss_kpts
@@ -254,6 +292,13 @@ class BodyFittingLoss(nn.Module):
             weighted_depth_map_loss = self.depth_map_weight * loss_depth_map
             total_loss = total_loss + weighted_depth_map_loss
             loss_dict['loss/depth_map'] = weighted_depth_map_loss.item()
+
+        # --- Prior mesh from another body model (dead-zone chamfer) ---
+        if self.mesh_prior_weight > 0 and target_prior_pts is not None:
+            loss_prior = self.mesh_prior_loss(est_prior_pts, target_prior_pts, self.mesh_prior_tau).mean()
+            weighted_prior_loss = self.mesh_prior_weight * loss_prior
+            total_loss = total_loss + weighted_prior_loss
+            loss_dict['loss/mesh_prior'] = weighted_prior_loss.item()
 
         loss_dict['loss/total_loss'] = total_loss.item()
         return total_loss, loss_dict

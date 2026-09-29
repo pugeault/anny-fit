@@ -147,6 +147,9 @@ class AnnyfitStage(pl.LightningModule):
         if 'sapiens_normal' in target:
             self.target.set_data('sapiens_normal', target['sapiens_normal'])
 
+        if 'prior_points' in target:
+            self.target.set_data('prior_points', target['prior_points'])
+
     def visualize_mesh(self, vertices, save_path, keypoints=None):
         vis_img = self.img.copy()
         try:
@@ -402,6 +405,31 @@ class AnnyfitStage(pl.LightningModule):
                 rendered_depth_map = (rendered_depth_map * anny_output['depth_scale']
                                       + anny_output['depth_shift'])
 
+        # Prior-mesh points: fixed surface samples (triangle + barycentric weights,
+        # drawn area-weighted from this frame's mesh on first use), so coverage is
+        # uniform over the body rather than following vertex density -- SMPL-X
+        # topology packs its vertices into the face. Sampling also keeps the
+        # O(Na*Nb) chamfer affordable.
+        est_prior_pts = target_prior_pts = None
+        if self.fitting_loss.mesh_prior_weight > 0 and self.target.prior_points.numel() > 0:
+            verts = anny_output['vertices']
+            faces = self.faces_int.long().to(verts.device)
+            if getattr(self, '_prior_samples', None) is None:
+                with torch.no_grad():
+                    tri = verts[0][faces]                                            # (F, 3, 3)
+                    area = torch.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0], dim=-1).norm(dim=-1)
+                g = torch.Generator().manual_seed(0)
+                n = self.target.prior_points.shape[1]
+                fidx = torch.multinomial(area.cpu(), n, replacement=True, generator=g)
+                uv = torch.rand(n, 2, generator=g)
+                flip = uv.sum(1) > 1
+                uv[flip] = 1 - uv[flip]                                              # uniform in triangle
+                bary = torch.stack([1 - uv.sum(1), uv[:, 0], uv[:, 1]], dim=1)
+                self._prior_samples = (faces[fidx.to(verts.device)], bary.to(verts))
+            sf, bary = self._prior_samples
+            est_prior_pts = (verts[:, sf] * bary[None, :, :, None]).sum(dim=2)      # (bs, n, 3)
+            target_prior_pts = self.target.prior_points
+
         # Calculate losses
         total_loss, loss_dict = self.fitting_loss(
             model_verts=anny_output['vertices'],
@@ -428,6 +456,8 @@ class AnnyfitStage(pl.LightningModule):
             rendered_depth_map=rendered_depth_map,
             target_depth_map=target_depth_map,
             depth_map_mask=depth_map_mask,
+            est_prior_pts=est_prior_pts,
+            target_prior_pts=target_prior_pts,
         )
         total_loss.backward()
         # Two separate failure modes, both fatal for a long warm-started chain
@@ -513,6 +543,7 @@ class TargetData(torch.nn.Module):
         self.register_buffer('masks', torch.tensor([]))
         self.register_buffer('depth_map', torch.tensor([]))
         self.register_buffer('sapiens_normal', torch.tensor([]))
+        self.register_buffer('prior_points', torch.tensor([]))   # (bs, P, 3) prior-mesh points
 
     def set_data(self, key: str, value: torch.Tensor):
         setattr(self, key, value)
