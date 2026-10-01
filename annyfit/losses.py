@@ -25,15 +25,30 @@ class MeshPriorLoss(nn.Module):
         lo, hi = p.min(dim=1).values, p.max(dim=1).values      # (B, 3)
         return (lo + hi) / 2, (hi - lo).norm(dim=-1)            # centre (B,3), diagonal (B,)
 
-    def forward(self, est_pts: torch.Tensor, prior_pts: torch.Tensor, tau: float) -> torch.Tensor:
-        ca, sa = self._bbox(est_pts.detach())
-        cb, sb = self._bbox(prior_pts)
-        a = est_pts - ca[:, None]                                            # (B, Na, 3)
-        b = (prior_pts - cb[:, None]) * (sa / sb.clamp(min=1e-6))[:, None, None]  # (B, Nb, 3)
-        d = torch.cdist(a, b)                                  # (B, Na, Nb)
-        d_ab = d.min(dim=2).values
-        d_ba = d.min(dim=1).values
-        return (F.relu(d_ab - tau) ** 2).mean(dim=1) + (F.relu(d_ba - tau) ** 2).mean(dim=1)
+    def forward(self, est_pts: torch.Tensor, prior_pts: torch.Tensor, tau: float,
+                est_cut_y: torch.Tensor | None = None) -> torch.Tensor:
+        """est_cut_y (B,): optional height (camera Y, Y-down) in the estimate's
+        frame -- only points above it (smaller Y) are compared. The cut is
+        carried into the prior at the same fraction of bounding-box height,
+        then each upper part is re-aligned on its own bounding box, so the
+        excluded lower body cannot skew the alignment."""
+        out = []
+        for i in range(est_pts.shape[0]):
+            a, b = est_pts[i], prior_pts[i]
+            if est_cut_y is not None:
+                a_lo, a_hi = a.detach().min(0).values, a.detach().max(0).values
+                b_lo, b_hi = b.min(0).values, b.max(0).values
+                frac = (est_cut_y[i].detach() - a_lo[1]) / (a_hi[1] - a_lo[1]).clamp(min=1e-6)
+                a = a[a.detach()[:, 1] < est_cut_y[i].detach()]
+                b = b[b[:, 1] < b_lo[1] + frac * (b_hi[1] - b_lo[1])]
+            ca, sa = self._bbox(a.detach()[None])
+            cb, sb = self._bbox(b[None])
+            a = a - ca                                                        # (Na, 3)
+            b = (b - cb) * (sa / sb.clamp(min=1e-6))                         # (Nb, 3)
+            d = torch.cdist(a, b)                                             # (Na, Nb)
+            out.append((F.relu(d.min(dim=1).values - tau) ** 2).mean()
+                       + (F.relu(d.min(dim=0).values - tau) ** 2).mean())
+        return torch.stack(out)
 
 
 class SapiensNormalLoss(nn.Module):
@@ -196,6 +211,12 @@ class BodyFittingLoss(nn.Module):
         self.mesh_prior_weight = prior_cfg.weight if prior_cfg else 0.0
         self.mesh_prior_tau = prior_cfg.get('tau', 0.04) if prior_cfg else 0.04
         self.mesh_prior_loss = MeshPriorLoss()
+        self.mesh_prior_upper_only = False
+
+        # Extra temporal-consistency weight on a subset of joints (set by the
+        # stage: lower_body_idx), on top of the all-joint pose_init term.
+        self.lower_body_pose_weight = 0.0
+        self.lower_body_idx = None
 
     def update_weights(self, stage_loss_weights: DictConfig):
         """Updates the loss weights for the current stage."""
@@ -203,6 +224,7 @@ class BodyFittingLoss(nn.Module):
             'pose_init_weight', 'shape_init_weight', 'verts_init_weight',
             'depth_weight', 'kp_depth_weight', 'ordering_depth_weight',
             'normal_weight', 'depth_map_weight', 'mesh_prior_weight', 'mesh_prior_tau',
+            'mesh_prior_upper_only', 'lower_body_pose_weight',
         )
         for attr_name in weights_to_update:
             default_value = getattr(self, attr_name)
@@ -216,7 +238,7 @@ class BodyFittingLoss(nn.Module):
                 target_shape_attr=None, target_depth=None, target_kp_depth=None,
                 rendered_normals=None, target_normals=None, normal_mask=None,
                 rendered_depth_map=None, target_depth_map=None, depth_map_mask=None,
-                est_prior_pts=None, target_prior_pts=None):
+                est_prior_pts=None, target_prior_pts=None, est_prior_cut_y=None):
         # --- Reprojection Losses ---
         loss_kpts = self.kpts_2d_loss(est_kpts_2d, target_kpts_2d[:, :, :2], conf=target_kpts_2d[:, :, 2])
         weighted_loss_kpts = self.kpts_2d_weight * loss_kpts
@@ -228,6 +250,10 @@ class BodyFittingLoss(nn.Module):
 
         weighted_verts_init_loss = self.verts_init_weight * verts_init_loss
         weighted_pose_loss = self.pose_init_weight * pose_loss
+        if self.lower_body_pose_weight > 0 and self.lower_body_idx is not None:
+            idx = self.lower_body_idx.to(body_pose.device)
+            lower_loss = ((body_pose[:, idx] - init_pose[:, idx]) ** 2).sum(dim=[-1, -2])
+            weighted_pose_loss = weighted_pose_loss + self.lower_body_pose_weight * lower_loss
         weighted_shape_loss = self.shape_init_weight * beta_loss
 
         total_loss = (
@@ -295,7 +321,9 @@ class BodyFittingLoss(nn.Module):
 
         # --- Prior mesh from another body model (dead-zone chamfer) ---
         if self.mesh_prior_weight > 0 and target_prior_pts is not None:
-            loss_prior = self.mesh_prior_loss(est_prior_pts, target_prior_pts, self.mesh_prior_tau).mean()
+            loss_prior = self.mesh_prior_loss(
+                est_prior_pts, target_prior_pts, self.mesh_prior_tau,
+                est_cut_y=est_prior_cut_y if self.mesh_prior_upper_only else None).mean()
             weighted_prior_loss = self.mesh_prior_weight * loss_prior
             total_loss = total_loss + weighted_prior_loss
             loss_dict['loss/mesh_prior'] = weighted_prior_loss.item()

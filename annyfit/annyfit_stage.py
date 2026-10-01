@@ -12,6 +12,9 @@ from utils import perspective_projection, get_camera_parameters, solvePnP
 from render import visualize_and_save, visualize_points
 from losses import BodyFittingLoss
 
+# Bones below the waist: hips (pelvis.L/.R) and legs.
+LOWER_BODY_BONE_PREFIXES = ('pelvis.', 'upperleg', 'lowerleg', 'foot', 'toe')
+
 
 from PIL import Image, ImageOps
 import numpy as np
@@ -117,6 +120,13 @@ class AnnyfitStage(pl.LightningModule):
 
         self._glctx = None  # lazy init on first forward (after .to(device))
         self._waist_joint_idx = None  # lazy lookup on first _render_scene() call
+
+        # Hip and leg bones (indices into body_pose, which excludes root): the
+        # target of the extra lower_body_pose_weight temporal term.
+        bone_names = self.anny_model.get_bodypose_parameters()[0]
+        self.fitting_loss.lower_body_idx = torch.tensor(
+            [i for i, n in enumerate(bone_names) if n.startswith(LOWER_BODY_BONE_PREFIXES)],
+            dtype=torch.long)
 
     def init_target(self, target):
         self.target = TargetData()
@@ -410,7 +420,7 @@ class AnnyfitStage(pl.LightningModule):
         # uniform over the body rather than following vertex density -- SMPL-X
         # topology packs its vertices into the face. Sampling also keeps the
         # O(Na*Nb) chamfer affordable.
-        est_prior_pts = target_prior_pts = None
+        est_prior_pts = target_prior_pts = est_prior_cut_y = None
         if self.fitting_loss.mesh_prior_weight > 0 and self.target.prior_points.numel() > 0:
             verts = anny_output['vertices']
             faces = self.faces_int.long().to(verts.device)
@@ -429,6 +439,10 @@ class AnnyfitStage(pl.LightningModule):
             sf, bary = self._prior_samples
             est_prior_pts = (verts[:, sf] * bary[None, :, :, None]).sum(dim=2)      # (bs, n, 3)
             target_prior_pts = self.target.prior_points
+            if self._waist_joint_idx is None:
+                names = ['root'] + self.anny_model.get_bodypose_parameters()[0]
+                self._waist_joint_idx = names.index('spine03')
+            est_prior_cut_y = coco_joints[:, self._waist_joint_idx, 1]               # (bs,)
 
         # Calculate losses
         total_loss, loss_dict = self.fitting_loss(
@@ -458,6 +472,7 @@ class AnnyfitStage(pl.LightningModule):
             depth_map_mask=depth_map_mask,
             est_prior_pts=est_prior_pts,
             target_prior_pts=target_prior_pts,
+            est_prior_cut_y=est_prior_cut_y,
         )
         total_loss.backward()
         # Two separate failure modes, both fatal for a long warm-started chain
